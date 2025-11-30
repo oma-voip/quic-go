@@ -148,7 +148,7 @@ func TestSendPacketsWithECNOnIPv4(t *testing.T) {
 	defer c.Close()
 
 	for _, val := range []protocol.ECN{protocol.ECNNon, protocol.ECT1, protocol.ECT0, protocol.ECNCE} {
-		_, _, err = c.WriteMsgUDP([]byte("foobar"), appendIPv4ECNMsg([]byte{}, val), addr)
+		_, _, err = c.WriteMsgUDP([]byte("foobar"), appendIPv4ECNMsg([]byte{}, val, 0), addr)
 		require.NoError(t, err)
 		select {
 		case p := <-packetChan:
@@ -168,7 +168,7 @@ func TestSendPacketsWithECNOnIPv6(t *testing.T) {
 	defer c.Close()
 
 	for _, val := range []protocol.ECN{protocol.ECNNon, protocol.ECT1, protocol.ECT0, protocol.ECNCE} {
-		_, _, err = c.WriteMsgUDP([]byte("foobar"), appendIPv6ECNMsg([]byte{}, val), addr)
+		_, _, err = c.WriteMsgUDP([]byte("foobar"), appendIPv6ECNMsg([]byte{}, val, 0), addr)
 		require.NoError(t, err)
 		select {
 		case p := <-packetChan:

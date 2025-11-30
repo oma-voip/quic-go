@@ -68,7 +68,9 @@ type oobConn struct {
 	OOBCapablePacketConn
 	batchConn batchConn
 
-	readPos uint8
+	dscpIPv4 byte
+	dscpIPv6 byte
+	readPos  uint8
 	// Packets received from the kernel, but not yet returned by ReadPacket().
 	messages []ipv4.Message
 	buffers  [batchSize]*packetBuffer
@@ -87,10 +89,13 @@ func newConn(c OOBCapablePacketConn, supportsDF bool) (*oobConn, error) {
 	if udpAddr, ok := c.LocalAddr().(*net.UDPAddr); ok && udpAddr.IP.IsUnspecified() {
 		needsPacketInfo = true
 	}
+
+	var dscpIPv4, dscpIPv6 byte
+
 	// We don't know if this a IPv4-only, IPv6-only or a IPv4-and-IPv6 connection.
 	// Try enabling receiving of ECN and packet info for both IP versions.
 	// We expect at least one of those syscalls to succeed.
-	var errECNIPv4, errECNIPv6, errPIIPv4, errPIIPv6 error
+	var errECNIPv4, errECNIPv6, errPIIPv4, errPIIPv6, errDSCPIPv4, errDSCPIPv6 error
 	if err := rawConn.Control(func(fd uintptr) {
 		errECNIPv4 = unix.SetsockoptInt(int(fd), unix.IPPROTO_IP, unix.IP_RECVTOS, 1)
 		errECNIPv6 = unix.SetsockoptInt(int(fd), unix.IPPROTO_IPV6, unix.IPV6_RECVTCLASS, 1)
@@ -99,6 +104,9 @@ func newConn(c OOBCapablePacketConn, supportsDF bool) (*oobConn, error) {
 			errPIIPv4 = unix.SetsockoptInt(int(fd), unix.IPPROTO_IP, ipv4PKTINFO, 1)
 			errPIIPv6 = unix.SetsockoptInt(int(fd), unix.IPPROTO_IPV6, unix.IPV6_RECVPKTINFO, 1)
 		}
+
+		dscpIPv4, errDSCPIPv4 = unix.GetsockoptByte(int(fd), unix.IPPROTO_IP, unix.IP_TOS)
+		dscpIPv6, errDSCPIPv6 = unix.GetsockoptByte(int(fd), unix.IPPROTO_IPV6, unix.IPV6_TCLASS)
 	}); err != nil {
 		return nil, err
 	}
@@ -124,6 +132,16 @@ func newConn(c OOBCapablePacketConn, supportsDF bool) (*oobConn, error) {
 			return nil, errors.New("activating packet info failed for both IPv4 and IPv6")
 		}
 	}
+	switch {
+	case errDSCPIPv4 == nil && errDSCPIPv6 == nil:
+		utils.DefaultLogger.Debugf("Read DSCP bits for IPv4 and IPv6.")
+	case errDSCPIPv4 == nil && errDSCPIPv6 != nil:
+		utils.DefaultLogger.Debugf("Read DSCP bits for IPv4.")
+	case errDSCPIPv4 != nil && errDSCPIPv6 == nil:
+		utils.DefaultLogger.Debugf("Read DSCP bits for IPv6.")
+	case errDSCPIPv4 != nil && errDSCPIPv6 != nil:
+		return nil, errors.New("reading DSCP failed for both IPv4 and IPv6")
+	}
 
 	// Allows callers to pass in a connection that already satisfies batchConn interface
 	// to make use of the optimisation. Otherwise, ipv4.NewPacketConn would unwrap the file descriptor
@@ -143,6 +161,8 @@ func newConn(c OOBCapablePacketConn, supportsDF bool) (*oobConn, error) {
 	oobConn := &oobConn{
 		OOBCapablePacketConn: c,
 		batchConn:            bc,
+		dscpIPv4:             dscpIPv4 >> 2, // get only the DSCP part (top 6 bits).
+		dscpIPv6:             dscpIPv6 >> 2, // get only the DSCP part (top 6 bits).
 		messages:             msgs,
 		readPos:              batchSize,
 		cap: connCapabilities{
@@ -258,9 +278,9 @@ func (c *oobConn) WritePacket(b []byte, addr net.Addr, packetInfoOOB []byte, gso
 		}
 		if remoteUDPAddr, ok := addr.(*net.UDPAddr); ok {
 			if remoteUDPAddr.IP.To4() != nil {
-				oob = appendIPv4ECNMsg(oob, ecn)
+				oob = appendIPv4ECNMsg(oob, ecn, c.dscpIPv4)
 			} else {
-				oob = appendIPv6ECNMsg(oob, ecn)
+				oob = appendIPv6ECNMsg(oob, ecn, c.dscpIPv6)
 			}
 		}
 	}
@@ -308,7 +328,7 @@ func (info *packetInfo) OOB() []byte {
 	return nil
 }
 
-func appendIPv4ECNMsg(b []byte, val protocol.ECN) []byte {
+func appendIPv4ECNMsg(b []byte, val protocol.ECN, dscp byte) []byte {
 	startLen := len(b)
 	b = append(b, make([]byte, unix.CmsgSpace(ecnIPv4DataLen))...)
 	h := (*unix.Cmsghdr)(unsafe.Pointer(&b[startLen]))
@@ -318,11 +338,11 @@ func appendIPv4ECNMsg(b []byte, val protocol.ECN) []byte {
 
 	// UnixRights uses the private `data` method, but I *think* this achieves the same goal.
 	offset := startLen + unix.CmsgSpace(0)
-	b[offset] = val.ToHeaderBits()
+	b[offset] = dscp<<2 + (val.ToHeaderBits() & ecnMask)
 	return b
 }
 
-func appendIPv6ECNMsg(b []byte, val protocol.ECN) []byte {
+func appendIPv6ECNMsg(b []byte, val protocol.ECN, dscp byte) []byte {
 	startLen := len(b)
 	const dataLen = 4
 	b = append(b, make([]byte, unix.CmsgSpace(dataLen))...)
@@ -333,6 +353,6 @@ func appendIPv6ECNMsg(b []byte, val protocol.ECN) []byte {
 
 	// UnixRights uses the private `data` method, but I *think* this achieves the same goal.
 	offset := startLen + unix.CmsgSpace(0)
-	binary.NativeEndian.PutUint32(b[offset:offset+dataLen], uint32(val.ToHeaderBits()))
+	binary.NativeEndian.PutUint32(b[offset:offset+dataLen], uint32(dscp<<2+(val.ToHeaderBits()&ecnMask)))
 	return b
 }
